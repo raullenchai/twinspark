@@ -100,6 +100,7 @@ MTU 9000 verified end-to-end (`ping -M do -s 8972`), RoCE `active_mtu` goes 1024
 | 9 | Codex CLI: `wire_api = "chat"` rejected | removed in codex 0.147 | `wire_api = "responses"` — vLLM 0.25 ships `/v1/responses` |
 | 10 | Codex warns `Model metadata for ds-0731 not found` | unknown model → fallback metadata | undocumented `model_catalog_json` key + catalog JSON (schema below) |
 | 11 | After restarting the head container, it hangs forever "waiting for 2 GPUs" | Ray head restart = **new GCS session**; the worker's old raylet never re-registers, yet `ray status` from the worker still succeeds against the new GCS → naive watchdogs never fire | worker watchdog must verify **its own IP is in `ray.nodes()` alive list**; param-change restarts bounce worker first, then head |
+| 12 | Agent sessions degrade at ~100–140k context: the model narrates intentions in a loop ("Let me grep… Let me view…") or repeats identical tool calls, while the server is perfectly healthy | **Model-side, not your rig**: DeepSeek's own tech report shows retrieval stable only to **128K**; past it, self-reinforcing in-context repetition takes over. Reproduced on official DashScope serving ([qwen-code #4695](https://github.com/QwenLM/qwen-code/issues/4695) — 43 identical tool calls while the model outputs "Let me stop this loop") | break the loop with `/compact`; prevent it with Codex `model_auto_compact_token_limit = 120000` (sits just above the observed 100–120k onset; drop to 100k if loops persist). 1M context is real for *reading*, not for *accumulated agent history* |
 
 ---
 
@@ -248,7 +249,7 @@ wire_api = "responses"                  # "chat" was removed in codex 0.147
 env_key = "VLLM_API_KEY"                # export VLLM_API_KEY=dummy (vLLM has no auth)
 ```
 
-The catalog JSON (undocumented but shipped feature) registers context window (1,048,576), tool support, and base instructions for the unknown model — kills the "fallback metadata" warning. Ubuntu 24.04 also needs `kernel.apparmor_restrict_unprivileged_userns=0` for codex's bubblewrap sandbox.
+The catalog JSON (undocumented but shipped feature) registers context window (1,048,576), tool support, and base instructions for the unknown model — kills the "fallback metadata" warning. Also set `model_auto_compact_token_limit = 120000` — see gotcha #12: agent sessions loop past ~128k context, and auto-compaction is the fence. Ubuntu 24.04 also needs `kernel.apparmor_restrict_unprivileged_userns=0` for codex's bubblewrap sandbox.
 
 ### Agentic evaluation: 3 medium projects, unattended
 
