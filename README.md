@@ -190,6 +190,22 @@ Takeaways:
 - Acceptance stays high enough (~75% over 5 positions) that deeper drafts keep paying: 7 beats 5 beats 3 for a single stream.
 - **Speculative decoding inverts at concurrency**: at 4 concurrent streams, spec3 wins (100 tok/s agg) and spec5/7 lose to plain decoding's batching. Tune for your workload — we serve 1–2 Codex streams, so 7 it is.
 
+### Addendum: multi-agent production tuning (measured after a day of real use)
+
+Running 2+ Codex agents against the endpoint revealed two things the clean-prompt numbers hide:
+
+1. **Agentic traffic is prefill-dominated.** Every tool round re-submits a large context; we observed ~8k tok/s of prompt processing sustained while decode sat at ~51 tok/s aggregate. Prefix caching absorbs most of the cost, but prefill still competes with decode under chunked prefill.
+2. **DSpark acceptance drops from ~75% to ~40% on agent contexts** — draft models predict clean prose/code well, but not tool output (file listings, test logs). Deep drafts waste compute exactly when you're busiest.
+
+So we ship two launch profiles (`launch/`):
+
+| profile | config | single-stream | 4-way agg | prefill | 7k TTFT |
+|---|---|---|---|---|---|
+| `launch-vllm.sh` (default) | spec7, seqs 6 | **74.8 tok/s** | 82.6 | 1674 | 4.26 s |
+| `launch-vllm-multiagent.sh` | spec3, seqs 8 | 66.3 | **105.7** | **1953** | **3.65 s** |
+
+Swap = copy over `launch-vllm.sh` + run `scripts/restart-vllm.sh` (~8 min).
+
 **Winner: `num_speculative_tokens=7`** → baked into `launch/launch-vllm.sh`.
 
 ---

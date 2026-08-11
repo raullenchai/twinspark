@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Single/dual-stream variant: spec7 — fastest per-stream (see README §5).
+# Multi-agent variant: spec3 + max-num-seqs 8 — best when serving 3+ concurrent agents.
 exec vllm serve /models/DeepSeek-V4-Flash-0731 \
   --served-model-name ds-0731 \
   --host 0.0.0.0 --port 8000 \
@@ -16,11 +16,11 @@ exec vllm serve /models/DeepSeek-V4-Flash-0731 \
   --block-size 256 \
   --max-model-len 1048576 \
   --gpu-memory-utilization 0.85 \
-  --max-num-seqs 6 \
+  --max-num-seqs 8 \
   --max-num-batched-tokens 8192 \
   --max-cudagraph-capture-size 24 \
   --generation-config vllm \
   --async-scheduling \
   --enable-chunked-prefill \
   --enable-prefix-caching \
-  --speculative-config '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
+  --speculative-config '{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}'
