@@ -1,0 +1,18 @@
+# QSFP compute link — both CX-7 rails, one file per node.
+# spark1 uses 10.0.0.1/10.0.1.1; spark2 uses 10.0.0.2/10.0.1.2.
+# Install: sudo cp 99-qsfp.yaml /etc/netplan/ && sudo chmod 600 /etc/netplan/99-qsfp.yaml && sudo netplan apply
+network:
+  version: 2
+  ethernets:
+    enp1s0f0np0:
+      addresses: [10.0.0.1/24]
+      mtu: 9000
+      dhcp4: false
+      dhcp6: false
+      optional: true
+    enP2p1s0f0np0:
+      addresses: [10.0.1.1/24]
+      mtu: 9000
+      dhcp4: false
+      dhcp6: false
+      optional: true

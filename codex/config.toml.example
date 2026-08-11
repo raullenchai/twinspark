@@ -1,0 +1,11 @@
+# ~/.codex/config.toml — OpenAI Codex CLI (>= 0.147) against the twinspark endpoint.
+# On the head node use localhost; from other machines use spark1's IP (or Tailscale IP).
+model = "ds-0731"
+model_provider = "twinspark"
+model_catalog_json = "/home/USER/.codex/ds0731-model-catalog.json"   # absolute path required
+
+[model_providers.twinspark]
+name = "DeepSeek V4 Flash 0731 (2x DGX Spark)"
+base_url = "http://localhost:8000/v1"
+wire_api = "responses"      # "chat" was removed in codex 0.147; vLLM 0.25 ships /v1/responses
+env_key = "VLLM_API_KEY"    # export VLLM_API_KEY=dummy — vLLM runs without auth
