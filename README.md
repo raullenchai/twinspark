@@ -53,6 +53,34 @@ curl -s localhost:8000/v1/models | jq -r '.data[0].id'   # -> ds-0731
 
 Each DGX Spark: GB10 (Grace 20-core ARM + Blackwell GPU, sm_121), 128 GB unified LPDDR5x (121 GiB usable), ~273 GB/s memory bandwidth, 4 TB NVMe, DGX OS 7.2.3 (Ubuntu 24.04 arm64), CUDA 13.0, driver 580.173.02.
 
+### How two Sparks serve one model (TP=2, not load balancing)
+
+A common misconception: "requests get load-balanced between the two Sparks." No — **both machines compute every single token together**. The model is 167 GB of weights; one Spark has 121 GiB. It physically cannot fit on one node, so vLLM shards it with tensor parallelism (TP=2): half the attention heads and half the MoE experts live on each machine.
+
+```
+ your clients (Codex agents, curl, ...)
+        │  all traffic → node 1, port 8000 — the ONLY endpoint
+        ▼
+ spark1: vLLM API server + scheduler
+        │  continuous batching: concurrent requests merge into one batch
+        ▼
+ every forward pass:
+   spark1 GPU ──┐  each computes its half of every layer
+                ├── NCCL allreduce per layer (over the 2× 200G rails)
+   spark2 GPU ──┘
+        ▼
+ each request receives its own tokens
+```
+
+Consequences worth internalizing:
+
+- **spark2 is invisible to clients.** There is nothing to route, balance, or failover between. One endpoint, period.
+- **Both GPUs sit at ~95% utilization even with a single request** — that's not waste, that's each node computing its half.
+- **The QSFP link is on the critical path of every token.** Each transformer layer does an allreduce across the cable, which is why fabric quality (§1) matters more than any vLLM flag: if NCCL silently falls back to TCP, decode collapses.
+- **Multiple agents are "balanced" in the batch dimension, not across nodes.** The scheduler on node 1 merges concurrent requests into one batch; each forward pass advances all of them by one token. Aggregate throughput goes *up* with concurrency (weights are read once per pass regardless of batch size — see §5 addendum).
+
+Data parallelism (one full model replica per node + a round-robin proxy in front) is the setup where "load balancing" would apply — that only works for models that fit on a single node, which this one does not.
+
 ### Discovery #1: one cable, two NICs
 
 The single QSFP cage is internally wired to **two independent ConnectX-7 controllers**. Plugging one 400G DAC lights up **two** 200G links (`enp1s0f0np0` + `enP2p1s0f0np0`, RDMA `rocep1s0f0` + `roceP2p1s0f0`). Each controller sits on a **PCIe Gen5 x4** link (~126 Gb/s usable), so per-rail RDMA tops out at ~109 Gb/s (`ib_write_bw`, 87% of the PCIe ceiling — the NIC is not the bottleneck, the PCIe lane is).
