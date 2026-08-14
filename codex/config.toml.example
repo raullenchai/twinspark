@@ -3,7 +3,7 @@
 model = "ds-0731"
 model_provider = "twinspark"
 model_catalog_json = "/home/USER/.codex/ds0731-model-catalog.json"   # absolute path required
-model_auto_compact_token_limit = 120000   # agent sessions loop past ~128k context (README gotcha #12)
+model_auto_compact_token_limit = 150000   # fence below the long-context minefield (README gotchas #12/#14; use 100-120k with nvfp4 KV)
 
 [model_providers.twinspark]
 name = "DeepSeek V4 Flash 0731 (2x DGX Spark)"

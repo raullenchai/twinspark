@@ -11,7 +11,7 @@ exec vllm serve /models/DeepSeek-V4-Flash-0731 \
   --tool-call-parser deepseek_v4 \
   --reasoning-parser deepseek_v4 \
   --enable-auto-tool-choice \
-  --kv-cache-dtype nvfp4_ds_mla \
+  --kv-cache-dtype fp8_ds_mla \
   --moe-backend flashinfer_b12x \
   --block-size 256 \
   --max-model-len 1048576 \

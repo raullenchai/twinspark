@@ -6,8 +6,8 @@
 
 - **Model**: `deepseek-ai/DeepSeek-V4-Flash-0731` — 284B MoE (13B active), native FP4 experts + FP8 attention, 1M context, MIT license. 167 GB of safetensors.
 - **Hardware**: 2× DGX Spark (GB10, 121 GiB unified memory each, 4 TB NVMe), linked by a single 400G QSFP DAC cable → shows up as **2× 200GbE RoCE links**.
-- **Engine**: vLLM 0.25.2 (community image `ghcr.io/anemll/dspark-vllm-gx10:0.1.1` with GB10/sm_121 kernels: FlashInfer-B12X MoE, NVFP4 DS-MLA KV cache, DSpark speculative decoding) + Ray for 2-node TP=2.
-- **Results**: **~75 tok/s single-stream decode** (DSpark speculative decoding = 2.74× over the 27 tok/s bandwidth floor), ~1.7k tok/s prefill, 1M context enabled, KV capacity 2.74M tokens. Full benchmark tables below.
+- **Engine**: vLLM 0.25.2 (community image `ghcr.io/anemll/dspark-vllm-gx10:0.1.1` with GB10/sm_121 kernels: FlashInfer-B12X MoE, native FP8 DS-MLA KV cache, DSpark speculative decoding) + Ray for 2-node TP=2.
+- **Results**: **~75 tok/s single-stream decode** (DSpark speculative decoding = 2.74× over the 27 tok/s bandwidth floor), ~1.7k tok/s prefill, 1M context enabled, KV capacity 2.68M tokens. Full benchmark tables below.
 - **Daily driver**: OpenAI Codex CLI pointed at the local endpoint (`wire_api = "responses"`) — agentic coding evaluated on 3 greenfield projects **plus one real feature landed in a 1,831-file codebase** (results below).
 
 ---
@@ -128,8 +128,9 @@ MTU 9000 verified end-to-end (`ping -M do -s 8972`), RoCE `active_mtu` goes 1024
 | 9 | Codex CLI: `wire_api = "chat"` rejected | removed in codex 0.147 | `wire_api = "responses"` — vLLM 0.25 ships `/v1/responses` |
 | 10 | Codex warns `Model metadata for ds-0731 not found` | unknown model → fallback metadata | undocumented `model_catalog_json` key + catalog JSON (schema below) |
 | 11 | After restarting the head container, it hangs forever "waiting for 2 GPUs" | Ray head restart = **new GCS session**; the worker's old raylet never re-registers, yet `ray status` from the worker still succeeds against the new GCS → naive watchdogs never fire | worker watchdog must verify **its own IP is in `ray.nodes()` alive list**; param-change restarts bounce worker first, then head |
-| 12 | Agent sessions degrade at ~100–140k context: the model narrates intentions in a loop ("Let me grep… Let me view…") or repeats identical tool calls, while the server is perfectly healthy | **Model-side, not your rig**: DeepSeek's own tech report shows retrieval stable only to **128K**; past it, self-reinforcing in-context repetition takes over. Reproduced on official DashScope serving ([qwen-code #4695](https://github.com/QwenLM/qwen-code/issues/4695) — 43 identical tool calls while the model outputs "Let me stop this loop") | break the loop with `/compact`; prevent it with Codex `model_auto_compact_token_limit = 120000` (sits just above the observed 100–120k onset; drop to 100k if loops persist). 1M context is real for *reading*, not for *accumulated agent history* |
+| 12 | Agent sessions degrade at ~100–140k context: the model narrates intentions in a loop ("Let me grep… Let me view…") or repeats identical tool calls, while the server is perfectly healthy | **Model-side, not your rig**: DeepSeek's own tech report shows retrieval stable only to **128K**; past it, self-reinforcing in-context repetition takes over. Reproduced on official DashScope serving ([qwen-code #4695](https://github.com/QwenLM/qwen-code/issues/4695) — 43 identical tool calls while the model outputs "Let me stop this loop") | break the loop with `/compact`; prevent it with auto-compaction. The fence depends on KV precision (§5 Addendum 2): with native `fp8_ds_mla` KV → **150k** (`model_auto_compact_token_limit = 150000`); with `nvfp4_ds_mla` → 100–120k. 1M context is real for *reading*, not for *accumulated agent history* |
 | 13 | After ~29h of stable serving, the whole engine crash-loops: `RayWorkerProc rank=[1] died unexpectedly` on the head, nothing in `docker logs`, container exits **code 0** | **Kernel OOM on the worker node.** Ray sets its own workers to `oom_score_adj=1000` — first in line for the kernel OOM killer. If the worker node does double duty (agents, git checkouts, anything spiky), one memory spike kills the model worker, and TP=2 means the whole engine dies with it. Verify with `dmesg | grep -i oom` on the worker node | run an OOM guard on **both hosts** (systemd loop resetting `oom_score_adj=-500` for `ray::`/`raylet`/`EngineCore`/`vllm serve` — must run on the host: containers lack `CAP_SYS_RESOURCE` to lower it). Kernel then sacrifices the cheap-to-restart processes instead of the 8-minute-reload model |
+| 14 | Long-context requests **randomly** collapse from ~100k — code-salad, XML repetition loops, or “this is a prompt injection test” refusals — while identical requests sometimes pass, and short requests are always perfect | V4’s sparse attention picks top-512 compressed KV blocks per query via a small FP4 “lightning indexer”; `nvfp4_ds_mla` KV quantization adds noise to exactly the representations that indexer scores. Wrong blocks → the answer is literally invisible, or format-heavy blocks lock generation into loops. Stochastic and content-dependent by nature | use the **native** `--kv-cache-dtype fp8_ds_mla`: same speed (64.1 vs 63.9 tok/s), −2% KV capacity, **4× fewer real long-context failures** (measured — §5 Addendum 2) |
 
 ---
 
@@ -140,7 +141,7 @@ MTU 9000 verified end-to-end (`ping -M do -s 8972`), RoCE `active_mtu` goes 1024
 | DGX OS | 7.2.3 (Ubuntu 24.04.4, kernel 6.17.0-1029-nvidia, aarch64) |
 | Driver / CUDA | 580.173.02 / 13.0 |
 | Container | `ghcr.io/anemll/dspark-vllm-gx10:0.1.1` + `pip install ray[default]` (ray 2.57.0), rebuilt as `ds0731-vllm:ray` |
-| vLLM | 0.25.2.dev0+g752a3a504 (DeepseekV4ForCausalLM, DSpark, nvfp4_ds_mla KV, flashinfer_b12x MoE) |
+| vLLM | 0.25.2.dev0+g752a3a504 (DeepseekV4ForCausalLM, DSpark, fp8_ds_mla KV (native — see gotcha #14), flashinfer_b12x MoE) |
 | NCCL | 2.30.7+cuda13.3 |
 | Model | `deepseek-ai/DeepSeek-V4-Flash-0731` (48 shards, 167 GB, native FP4/FP8 — **this is the highest precision that exists**; don't waste time on GGUF re-quants) |
 | Codex CLI | 0.147.0 (aarch64-musl static binary) |
@@ -170,7 +171,7 @@ vllm serve /models/DeepSeek-V4-Flash-0731 \
   --tool-call-parser deepseek_v4 \
   --reasoning-parser deepseek_v4 \
   --enable-auto-tool-choice \
-  --kv-cache-dtype nvfp4_ds_mla \
+  --kv-cache-dtype fp8_ds_mla \
   --moe-backend flashinfer_b12x \
   --block-size 256 \
   --max-model-len 1048576 \
@@ -199,7 +200,7 @@ docker: --network host --ipc=host --ulimit memlock=-1 --ulimit stack=67108864
         --cap-add=IPC_LOCK --device=/dev/infiniband --gpus all
 ```
 
-Memory budget after load: model 2× 79.2 GiB, KV cache 20.5 + 18.4 GiB → **2,737,768 tokens of KV capacity** (nvfp4_ds_mla, 584-byte padded sparse-MLA envelope).
+Memory budget after load: model 2× 79.2 GiB, KV cache 20.5 + 18.4 GiB → **2,682,310 tokens of KV capacity** (fp8_ds_mla — the native format. We initially ran nvfp4_ds_mla: it buys only ~2% more capacity and quadruples long-context failures, see gotcha #14 / §5 Addendum 2).
 
 ---
 
@@ -240,6 +241,32 @@ Swap = copy over `launch-vllm.sh` + run `scripts/restart-vllm.sh` (~8 min).
 
 ---
 
+### Addendum 2: the long-context minefield, measured (and why KV precision is the fuse)
+
+We probed needle-retrieval reliability at growing context sizes: non-guessable codes planted at multiple depths in a synthetic log, 3-needle exact-match queries, temperature 0, 5 trials per size. “Real failure” = wrong/missing/refused answer; “junk” = correct answer with trailing garbage.
+
+| context | nvfp4_ds_mla KV | fp8_ds_mla KV (native) |
+|---|---|---|
+| 74k | 0/5 | 0/5 |
+| 92k | 0/5 | — |
+| 110k | 1/5 | 0/5 (2 junk) |
+| 129k | 2/5 | 0/5 (3 junk) |
+| 148k | 1/5 | 0/5 (1 junk) |
+| 166k | 2/5 | 2/5 |
+| 184k | 3/5 | 0/5 (1 junk) |
+| **real failures total** | **8/25** | **2/25** |
+
+What this says:
+
+- **There is no hard “128K cliff” — it’s a stochastic minefield.** The same request can pass or collapse on different runs. That matches the architecture: the sparse-attention “lightning indexer” (FP4, top-512 block selection) is a small network whose scoring gets noisy as the haystack grows; near-tie scores flip block selection run to run.
+- **4-bit KV quantization is an amplifier, not a bystander.** Switching to the native `fp8_ds_mla` cut real failures 4× at identical speed and −2% capacity. The failure pocket at ~166k persists on both — that one looks model-side.
+- **Real-agent burn-in (fp8 KV):** a Claude Code session stayed fully coherent through **163k of accumulated tool-call history**, then survived its own compaction cycle (~184k → 141k) and kept working — zero loops. On nvfp4 KV we saw agent loops from ~100k in daily use.
+
+Practical fences: with `fp8_ds_mla` → auto-compact at ~150k (codex `model_auto_compact_token_limit = 150000`; Claude Code `CLAUDE_CODE_MAX_CONTEXT_TOKENS=160000` compacts ≈148k). With `nvfp4_ds_mla` → stay at 100–120k. Either way, fence *below* the ~166k pocket.
+
+Claude Code works against this stack directly, by the way — vLLM 0.25 serves an Anthropic-compatible `/v1/messages`, so `ANTHROPIC_BASE_URL=http://<node1>:8000` + `ANTHROPIC_MODEL=ds-0731` is all it takes.
+
+
 ## 6. Full benchmark (`vllm bench serve`, random dataset)
 
 | scenario | conc | output tok/s | total tok/s | TTFT p50 / p99 | TPOT p50 / p99 |
@@ -278,7 +305,7 @@ wire_api = "responses"                  # "chat" was removed in codex 0.147
 env_key = "VLLM_API_KEY"                # export VLLM_API_KEY=dummy (vLLM has no auth)
 ```
 
-The catalog JSON (undocumented but shipped feature) registers context window (1,048,576), tool support, and base instructions for the unknown model — kills the "fallback metadata" warning. Also set `model_auto_compact_token_limit = 120000` — see gotcha #12: agent sessions loop past ~128k context, and auto-compaction is the fence. Ubuntu 24.04 also needs `kernel.apparmor_restrict_unprivileged_userns=0` for codex's bubblewrap sandbox.
+The catalog JSON (undocumented but shipped feature) registers context window (1,048,576), tool support, and base instructions for the unknown model — kills the "fallback metadata" warning. Also set `model_auto_compact_token_limit = 150000` (with the native fp8_ds_mla KV cache; use 100–120k if you run nvfp4 KV) — see gotchas #12/#14: agent sessions loop in long contexts, and auto-compaction is the fence. Ubuntu 24.04 also needs `kernel.apparmor_restrict_unprivileged_userns=0` for codex's bubblewrap sandbox.
 
 ### Agentic evaluation: 3 medium projects, unattended
 
